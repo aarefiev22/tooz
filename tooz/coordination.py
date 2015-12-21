@@ -406,6 +406,19 @@ class CoordinationDriver(object):
         pass
 
     @staticmethod
+    def make_job_board(name):
+        """Request the creation of a job board with the given name.
+
+        If a backend can not (or will not) have a suitable job board
+        then it will raise :py:class:`tooz.NotImplemented` to signify
+        this. Read over the coordination drivers documentation to know
+        which ones do offer job boards and which ones do not (it is also
+        good to know the capabilities that each driver offers in regards
+        to the API it exposes to implement jobs).
+        """
+        raise tooz.NotImplemented
+
+    @staticmethod
     def create_group(group_id):
         """Request the creation of a group asynchronously.
 
@@ -645,21 +658,8 @@ def get_coordinator(backend_url, member_id,
     return d
 
 
-class ToozError(Exception):
-    """Exception raised when an internal error occurs.
-
-    Raised for instance in case of server internal error.
-
-    :ivar cause: the cause of the exception being raised, when not none this
-                 will itself be an exception instance, this is useful for
-                 creating a chain of exceptions for versions of python where
-                 this is not yet implemented/supported natively.
-
-    """
-
-    def __init__(self, message, cause=None):
-        super(ToozError, self).__init__(message)
-        self.cause = cause
+# Alias to new location (so that people using old import still work).
+ToozError = tooz.ToozError
 
 
 class ToozDriverChosenPoorly(ToozError):
