@@ -16,6 +16,9 @@
 
 import collections
 import copy
+import json
+import time # remove
+import threading
 
 from kazoo import client
 from kazoo import exceptions
@@ -27,10 +30,13 @@ from kazoo.handlers import threading as threading_handler
 from kazoo.protocol import paths
 from oslo_utils import encodeutils
 from oslo_utils import strutils
+from oslo_utils import uuidutils
+
 import six
 from six.moves import filter as compat_filter
 
 from tooz import coordination
+from tooz import jobs
 from tooz import locking
 from tooz import utils
 
@@ -278,7 +284,7 @@ class BaseZooKeeperDriver(coordination.CoordinationDriver):
             coordination.raise_with_cause(coordination.OperationTimedOut,
                                           encodeutils.exception_to_unicode(e),
                                           cause=e)
-        except exceptions.NoNodeError:
+        except exceptions.NoNodeError as e:
             raise coordination.MemberNotJoined(group_id, member_id)
         except exceptions.ZookeeperError as e:
             coordination.raise_with_cause(coordination.ToozError,
@@ -396,6 +402,13 @@ class BaseZooKeeperDriver(coordination.CoordinationDriver):
             else:
                 cleaned_args.append(arg)
         return paths.join(*cleaned_args)
+
+
+    def make_job_board(self, name): 
+        return ZooJobBoard(name, self._coord) 
+
+    def fetch_job_board(self, name):
+        return  ZooJobBoard(name, self._coord)
 
 
 class KazooDriver(BaseZooKeeperDriver):
@@ -630,6 +643,225 @@ class KazooDriver(BaseZooKeeperDriver):
         self.run_elect_coordinator()
         return results
 
+class ZooJob(jobs.Job):
+    def __init__(self, board, name,
+                 details=None, uuid=None):
+        super(ZooJob, self).__init__(board, name, uuid, details)
+
+    def created_on(self):
+        pass
+
+    def last_modified(self):
+        pass
+
+    def state(self):
+        pass
+
+class ZooJobBoard(jobs.JobBoard):
+
+    # We have now two zk nodes at root level:    |Maybe we should have something
+    # storing group/member and new on: board/job:|like this:
+    # |                                          |
+    # |--tooz                                    |--tooz
+    # |  |--group1                               |  |--groups
+    # |  |  |--member1                           |  |  |--group1
+    # |  |  |--member2                           |  |  |  |
+    # |  |--group2                               |  |  |  |--member1
+    # |--tooz_board                              |  |  |  |--member2
+    # |  |--board1                               |  |--boards
+    # Maybe we should have something like this:  |  |  |--board1
+    #                                            |  |  |  |--job1
+    TOOZ_BOARD_NAMESPACE = b"tooz_board"
+
+
+    def __init__(self, name, client):
+        super(ZooJobBoard, self).__init__(name)
+        self._client = client
+        self.timeout_exception = self._client.handler.timeout_exception
+        self._job_cond = threading.Condition()
+        self._base_path = paths.join('/', self.TOOZ_BOARD_NAMESPACE, name)
+
+    def _get_job_handler(self, async_result, timeout, timeout_exception):
+        try:
+            job_ids = async_result.get(block=True, timeout=timeout)
+        except timeout_exception as e:
+            coordination.raise_with_cause(coordination.OperationTimedOut,
+                                          encodeutils.exception_to_unicode(e),
+                                          cause=e)
+        except exceptions.NoNodeError as e:
+            coordination.raise_with_cause(coordination.ToozError,
+                                          "Tooz namespace '%s' has not"
+                                          " been created" % self._namespace,
+                                          cause=e)
+        except exceptions.ZookeeperError as e:
+            coordination.raise_with_cause(coordination.ToozError,
+                                          encodeutils.exception_to_unicode(e),
+                                          cause=e)
+        return set(job_id.encode('ascii') for job_id in job_ids)
+
+
+    def _fetch_jobs(self, ensure_fresh=False):
+        result = self._client.get_children(self._base_path)
+        print("Result: %s" % result)
+        return result
+
+    def iterjobs(self, only_unclaimed=False, ensure_fresh=False):
+        board_removal_func = lambda job: self._remove_job(job.path)
+        return jobs.JobBoardIterator(self, only_unclaimed=only_unclaimed,
+            ensure_fresh=ensure_fresh, board_fetch_func=self._fetch_jobs,
+            board_removal_func=board_removal_func)
+
+
+    def wait(self, timeout=None):
+        time.sleep(timeout if timeout else None)
+
+    def job_count(self):
+        return len(self._known_jobs)
+
+    def find_owner(self, job):
+        try:
+            self._client.sync(job.lock_path)
+            raw_data, _lock_stat = self._client.get(job.lock_path)
+            data = data = json.loads(raw_data)
+            owner = data.get("owner")
+        except exceptions.NoNodeError:
+            owner = None
+            return owner
+
+    def name(self):
+        return self._name
+
+    def _get_owner_and_data(self, job):
+        lock_data, lock_stat = self._client.get(job.lock_path)
+        job_data, job_stat = self._client.get(job.path)
+        return (json.loads(lock_data), lock_stat,
+                json.loads(job_data), job_stat)
+
+    def _remove_job(self, path):
+        if path not in self._known_jobs:
+            return
+        with self._job_cond:
+            self._known_jobs.pop(path, None)
+
+    def consume(self, job, who):
+        try:
+            owner_data = self._get_owner_and_data(job)
+            lock_data, lock_stat, data, data_stat = owner_data
+        except exceptions.NoNodeError:
+            excp.raise_with_cause(excp.NotFound,
+                                  "Can not consume a job %s"
+                                  " which we can not determine"
+                                  " the owner of" % (job.uuid))
+        if lock_data.get("owner") != who:
+            raise excp.JobFailure("Can not consume a job %s"
+                                  " which is not owned by %s"
+                                  % (job.uuid, who))
+        txn = self._client.transaction()
+        txn.delete(job.lock_path, version=lock_stat.version)
+        txn.delete(job.path, version=data_stat.version)
+        txn.commit()
+        self._remove_job(job.path)
+
+    # Refactor to avoid duplication 
+    def _create_job_handler(self, async_result, timeout,
+                            timeout_exception, job_uuid, value):
+        try:
+            async_result.get(block=True, timeout=timeout)
+            return ZooJob(self, **value)
+        except timeout_exception as e:
+            coordination.raise_with_cause(coordination.OperationTimedOut,
+                                          encodeutils.exception_to_unicode(e),
+                                          cause=e)
+        except exceptions.NoNodeError as e:
+            coordination.raise_with_cause(coordination.ToozError,
+                                          "Tooz namespace '%s' has not"
+                                          " been created" % self._base_path,
+                                          cause=e)
+        except exceptions.NodeExistsError:
+            raise jobs.JobAlreadyExist(job_id)
+        except exceptions.ZookeeperError as e:
+            coordination.raise_with_cause(coordination.ToozError,
+                                          encodeutils.exception_to_unicode(e),
+                                          cause=e)
+
+    def post(self, name, details=None):
+        uuid = uuidutils.generate_uuid()
+        job_data = {
+        'uuid': uuid,
+        'name': name,
+        'details': details}
+
+        # Posible TypeError here
+        raw_data = encodeutils.safe_encode(
+            json.dumps(job_data),
+            encoding='utf-8',
+            errors='strict')
+
+        job_path = paths.join(self._base_path, name)
+        async_result = self._client.create_async(job_path, value=raw_data,
+                                                 sequence=True,
+                                                 ephemeral=False,
+                                                 makepath=True)
+        #job = ZooJob(self, name, self._client, job_path,
+        #             details, uuid)
+
+        #with self._job_cond:
+        #    self._known_jobs[job_path] = job
+        #    self._job_cond.notify_all()
+        return ZooAsyncResult(
+             async_result, self._create_job_handler,
+             timeout_exception=self._client.handler.timeout_exception,
+             job_uuid=uuid, value=job_data)
+
+
+    def claim(self, job, who):
+        def _unclaimable_try_find_owner(cause):
+            try:
+                owner = self.find_owner(job)
+            except Exception:
+                owner = None
+            if owner:
+                message = "Job %s already claimed by '%s'" % (job.uuid, owner)
+            else:
+                message = "Job %s already claimed" % (job.uuid)
+            raise Exception(message) #excp.UnclaimableJob,
+
+        # NOTE(harlowja): post as json which will allow for future changes
+        # more easily than a raw string/text.
+        value = json.dumps({
+            'owner': who,
+        })
+        # Ensure the target job is still existent (at the right version).
+        job_data, job_stat = self._client.get(job.path)
+        txn = self._client.transaction()
+        # This will abort (and not create the lock) if the job has been
+        # removed (somehow...) or updated by someone else to a different
+        # version...
+        txn.check(job.path, version=job_stat.version)
+        txn.create(job.lock_path, value=encodeutils.safe_encode(
+                                       json.dumps(job_posting),
+                                       encoding='utf-8',
+                                       errors='strict'),
+                   ephemeral=True)
+        try:
+            txn.commit()
+        except exceptions.NodeExistsError as e:
+            _unclaimable_try_find_owner(e)
+
+    def abandon(self, job, who):
+        pass
+
+    def trash(self, job, who):
+        pass
+
+    def connected(self):
+        pass
+
+    def connect(self):
+        pass
+
+    def close(self):
+        pass
 
 class ZooAsyncResult(coordination.CoordAsyncResult):
     def __init__(self, kazoo_async_result, handler, **kwargs):
@@ -642,3 +874,5 @@ class ZooAsyncResult(coordination.CoordAsyncResult):
 
     def done(self):
         return self._kazoo_async_result.ready()
+
+

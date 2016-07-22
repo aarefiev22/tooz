@@ -419,6 +419,10 @@ class CoordinationDriver(object):
         raise tooz.NotImplemented
 
     @staticmethod
+    def fetch_job_board(name):
+        raise tooz.NotImplemented
+
+    @staticmethod
     def create_group(group_id):
         """Request the creation of a group asynchronously.
 

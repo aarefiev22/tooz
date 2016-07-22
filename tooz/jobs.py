@@ -127,6 +127,7 @@ class Job(object):
             details = {}
         self._details = details
         self._board = board
+        self._state = JobState.UNCLAIMED
 
     def wait(self, timeout=None,
              delay=0.01, delay_multiplier=2.0, max_delay=60.0,
@@ -173,7 +174,7 @@ class Job(object):
     def created_on(self):
         """The ``datetime.datetime`` the job was created on."""
 
-    @abc.abstractproperty
+    @property
     def state(self):
         """Access the current state of this job.
 
@@ -186,6 +187,7 @@ class Job(object):
         situtation (typically stopping all further work is one
         mechanism).
         """
+        return self._state 
 
     @property
     def uuid(self):
